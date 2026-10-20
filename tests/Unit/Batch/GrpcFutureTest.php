@@ -227,8 +227,6 @@ class GrpcFutureTest extends TestCase
 
         $future = new GrpcFuture($call, RawGetResponse::class);
         unset($future);
-
-        $this->expectNotToPerformAssertions();
     }
 
     public function testDestructAfterWaitDoesNotCancel(): void
@@ -250,8 +248,6 @@ class GrpcFutureTest extends TestCase
         $future = new GrpcFuture($call, RawGetResponse::class);
         $future->wait();
         unset($future);
-
-        $this->expectNotToPerformAssertions();
     }
 
     public function testCancelSwallowsUnderlyingCallException(): void
