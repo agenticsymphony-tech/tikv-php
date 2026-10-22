@@ -39,11 +39,39 @@ All work happens on feature branches; merges go through squash-merged PRs.
 Static analysis runs at level 9 and every source file must declare strict
 types. PSR-12 + Slevomat coding standard (enforced by PHPCS).
 
-## No enforced coverage floor
+## The coverage floor is enforced, and it is a ratchet (issue #362)
 
-Unlike some related projects, CI does not enforce a minimum coverage
-percentage. Coverage is collected (PCOV, `grpc-unit-tests` job) but is
-informational only.
+CI enforces a **minimum line coverage** for the `Unit` + `Grpc` suites. The threshold lives in
+exactly one place, `DEFAULT_COVERAGE_FLOOR` in `bin/check-coverage.php`, and it is a **ratchet**:
+it is set a little below the measured coverage and only ever moves up. `composer test:coverage`
+runs the same suites under a coverage driver and applies the same threshold, so a red build is
+reproducible locally; the CI job additionally uploads the Clover report as the `coverage-clover`
+artifact.
+
+Three decisions are worth keeping:
+
+1. **The metric is the line coverage of the hand-written code, not of the whole tree.**
+   `phpunit.xml` excludes the generated `src/Proto` classes from the `<source>` set. They are
+   ~62 % of the executable lines of `src/`, they are not written by hand and nobody writes tests
+   for them, so counting them would make the floor measure the generated code instead of the
+   client (the same tree measures 42 % with them and 87 % without). The issue's own baselines
+   (58.4 % for `Unit`, 70.2 % for `Unit` + `Grpc`) are only reproducible on this metric — measured
+   on the audit-time tree (2026-08-08) the whole-tree numbers were 14.6 % and 18.3 %.
+2. **The floor is checked in the existing `grpc-unit-tests` job, not in a new one.** That job
+   already installs PCOV and `ext-grpc`, so it can run the combined suites in one process and
+   produce one report covering the whole client; the `unit-tests` matrix keeps running the `Unit`
+   suite on every PHP version without coverage, so the matrix is not slowed down.
+3. **The threshold is below the measurement, never above it.** A floor above the current coverage
+   fails the build immediately; the shipped floor is 87.0 %, set against a measured 87.6 % (PCOV,
+   PHP 8.4 — the measurement moves with the tree, the floor only moves up). PCOV and Xdebug measure
+   the same metric within a few tenths of a point (0.3 points apart on the tree the floor was set
+   on), so the same floor holds whichever driver a contributor has installed.
+
+The floor is deliberately *not* a quality target for new code: it is a regression guard. A change
+that drops the coverage fails CI until either the missing tests are added or the floor is
+explicitly lowered — and lowering it is a visible act, because the value lives in
+`bin/check-coverage.php` and `tests/Unit/Bin/CoverageFloorCheckTest.php` reads it back from there
+(a report a tenth of a point below it has to fail).
 
 ## PHP support: >= 8.2, CI matrix 8.2–8.4
 
@@ -72,6 +100,66 @@ E2E suites (`E2E-RawKV`, `E2E-TxnKV`) spin up real TiKV clusters via docker
 compose — they only run when relevant paths change (`src/`, `tests/E2E/`,
 docker/composer files, CI workflow).
 
+## A test runner that selects nothing must exit non-zero, and the E2E entry point runs the suites one after the other (issue #361)
+
+Three decisions that belong together, because either one alone leaves the
+other half of the bug open:
+
+1. **Every PHPUnit invocation in the repository passes
+   `--fail-on-empty-test-suite`.** PHPUnit answers a suite selector that
+   matches nothing with "No tests executed!" and exit code **0**, so a
+   renamed suite is indistinguishable from a passing run. The flag turns
+   that into a non-zero exit code. It is deliberately *not*
+   `--fail-on-skipped` for the suites as a whole: the E2E suites skip
+   legitimately (no Docker socket for the PD-failover tests, no `proc_open`
+   for the concurrency test), so that flag would make an ordinary developer
+   machine red.
+2. **`composer test:e2e` runs the two end-to-end suites one after the
+   other, each against the cluster mode it needs** — it delegates to
+   `scripts/test-e2e.sh` (`make test-e2e`), which starts the V1TTL cluster
+   for `E2E-RawKV`, tears it down, starts the V1 cluster
+   (`docker-compose.txnkv.yml`) for `E2E-TxnKV` and runs each suite in its
+   own PHPUnit process. A single PHPUnit run cannot do that: the suites
+   need cluster modes of their own (V1TTL for RawKV, V1 for TxnKV, API V2
+   for ApiV2), so one cluster cannot serve two of them and a run that
+   selects both would be red by construction. The per-mode scripts
+   `composer test:e2e:raw`, `composer test:e2e:txn` and
+   `composer test:e2e:apiv2` run one suite against a cluster that is
+   already up; they share `scripts/test-e2e-suite.sh`, which owns the
+   environment each suite needs.
+3. **A missing cluster fails fast instead of failing late.** Without a
+   cluster every end-to-end test used to spend the client's whole retry
+   budget (measured: 18.8 s) before it reported the connection error, so
+   the 242 end-to-end tests needed about an hour to print their summary.
+   `tests/E2E/ClusterProbe.php` asks PD for its member list before the
+   first test of a class and fails the class when PD does not answer — a
+   failure, not a skip, because a skipped suite looks exactly like a suite
+   that tested nothing.
+
+The fourth decision closes the remaining hole of the first one: **a skipped
+test counts as a test, so `--fail-on-empty-test-suite` does not fire on
+it.** The API V2 suite skips every one of its tests unless
+`TIKV_API_VERSION=2` is set, so a runner that leaves the variable out
+turns the lane into a green no-op (measured: "Tests: 4, Skipped: 4", exit
+**0**). The runners that own the lane therefore set the environment
+themselves — `scripts/test-e2e-suite.sh` exports `TIKV_API_VERSION=2`,
+requires `TIKV_ALT_KEYSPACE` (the second keyspace the suite compares
+against) and adds `--fail-on-skipped`, which is safe there because the
+suite has no legitimate skip once the environment is set;
+`scripts/test-e2e-apiv2.sh` does the same for the Docker lane. The
+alternative — dropping the per-mode command and pointing at the lane's
+runner — would have left the host-side entry point unexplained.
+
+The rules are machine-enforced, not a convention:
+`tests/Unit/Ci/TestSuiteSelectorGuardTest.php` fails when a `--testsuite`
+selector used in `composer.json`, in `scripts/*.sh`, in the `Makefile`, in
+the `docker-compose*.yml` files or in the CI workflow names a suite
+`phpunit.xml` does not declare, when a PHPUnit invocation runs without
+`--fail-on-empty-test-suite`, when no runner selects an end-to-end suite,
+when a single invocation selects two end-to-end suites that need different
+cluster modes, or when a runner selects the API V2 suite without running it
+with `TIKV_API_VERSION=2`.
+
 ## `scan(limit: 0)`'s `maxScanRows` guard is per fetched page, not per row (issue #191)
 
 Review of the #191 branch (`RawKvScanner::assertWithinScanLimit()`) confirmed
@@ -88,6 +176,52 @@ guard to per-row without accepting that cost. A useful side effect to keep:
 the loop can only continue while accumulated rows are below `maxScanRows`, so
 the guard also bounds the page count — even a server that ignores the
 continuation cursor cannot make `scan(limit: 0)` loop forever.
+
+## A scan that hits a cap throws; it never returns a partial range (issue #440)
+
+Issue #440 (DIV-04) closed the remaining silent truncation in the scan
+surface. The decision worth recording is the **shape of the contract**, not
+the diff:
+
+1. **A scan never truncates silently, and the return type does not change.**
+   The alternative shapes the issue listed were a result object with a
+   `truncated` flag and a per-call "did it truncate" method. Both change the
+   public API of four methods, and the flag would have to be threaded through
+   `RawKvScanner`, `RawKvClient` and `Transaction` for a fact the caller can
+   already derive. The existing `ScanLimitExceededException` was reused
+   instead: the return type stays `array<array{key: string, value: ?string}>`,
+   and a truncated result is signalled by an exception the caller can catch.
+   `ScanLimitExceededException::forTransactionScan()` exists only because the
+   RawKV wording names `options['maxScanRows']`, which does not apply to the
+   transactional cap; the type, the accessors (`getMaxRows()`,
+   `getScannedRows()`) and the "never retry" verdict are shared.
+2. **A bounded scan truncates by contract, an unbounded one may not.** With
+   an explicit `limit > 0` the caller asked for at most that many rows, so
+   the result is capped and the caller detects a possibly-truncated result by
+   comparing the count with the limit — that is documented, not thrown. With
+   `limit: 0` the call means "the whole range", so a cap that stops it early
+   is a failure, not a result.
+3. **The two scan surfaces keep their own cap, because they are different
+   operations.** The RawKV path pages the range internally (issue #191) and is
+   bounded by `options['maxScanRows']` (default 100000), a *memory* guard. The
+   transactional path reads at the transaction's snapshot and does not page,
+   so it is bounded by `Transaction::MAX_SCAN_LIMIT` (10240) — a *contract*
+   cap. Unifying them (teaching the transactional scan to page) would change
+   a snapshot read into a multi-RPC one, and the transaction's write-set merge
+   and lock handling with it; that is a bigger change than this issue
+   authorises, so the two caps stay and both are documented.
+4. **"The cap was reached" and "rows are missing" are different facts.** The
+   RawKV guard can compare `>` because the scan keeps reading until the range
+   ends. The transactional scan stops at the cap, so it probes — one `KvScan`
+   for a single row after the last key it returned — and throws only when
+   that probe finds a row. A range with exactly 10240 rows is complete and is
+   returned. The probe costs one extra RPC in the boundary case only.
+5. **The write-set merge is not capped on the unbounded path.** `finalizeScanResults()`
+   applied the scan limit to the *merged* result, so a transaction whose write
+   set held in-range keys could have them dropped once the TiKV read had
+   filled the budget — a second, quieter truncation of the same class. The
+   unbounded path passes no limit to the merge: the cap bounds the TiKV read,
+   and the transaction's own writes must stay visible (read-your-writes).
 
 ## All key ordering goes through `Client\Util\KeyOrder`, enforced by a PHPStan rule (issue #186)
 
@@ -673,6 +807,42 @@ the wall-clock deadline, the #233 fatal-path interaction, and the attempt cap.
 Do not collapse the three bounds into one value: the 30 s wall clock is the
 binding one for a `ServerBusy` storm (1–2 s sleeps), the sleep budgets are what
 bound a millisecond-scale retry storm that no wall clock would catch.
+
+## The ext-grpc channel semantics are verified, not assumed (issue #283)
+
+Issue #283 ("isolate `Grpc\Channel` instances across `GrpcClient` objects")
+assumed that `Channel::close()` destroys the underlying channel, so that
+closing one client invalidated the channel another client held. Verified
+against the deployed extension (grpc 1.83.0, `src/php/ext/grpc/channel.c`),
+that assumption is false: `close()` is a reference-count decrement
+(`php_grpc_channel_unref()`), the process-global persistent table is itself a
+holder of the channel, and a shared channel is always persisted — so closing
+one client cannot destroy a channel another client holds.
+
+The decisions that follow:
+
+1. **Do not work around a hazard that does not exist.** `force_new` was
+   rejected — it would give up the cross-request connection reuse for a
+   hazard that does not exist — and dropping the PHP-side reference instead of
+   `close()` was rejected as behaviourally identical to `close()` in that
+   version (both are the same refcount decrement) while deleting the tests
+   that cover the error handling of the close path.
+2. **Pin the verified semantics with a regression test**
+   (`tests/Unit/Grpc/GrpcClientChannelIsolationTest.php`), so a future
+   extension that turns `close()` into a destroy fails the suite instead of
+   silently breaking a second client.
+3. **Document what the API does, not what it promises.** `closeChannel()`
+   drops the cached handle but does not force a reconnect (the persistent
+   entry survives, so the next call reuses the same underlying channel and
+   the same TCP connection), and `close()` does not release the TCP
+   connection (the persistent entry keeps it warm until the process ends).
+   Both are now stated as they are.
+
+The ownership model that answers "who closes what" — a transport belongs to
+whoever created it, `options['grpcClient']` injects a borrowed one, and the
+transport options are rejected next to it — was decided in issue #407 and is
+documented in `README.md` and `docs/configuration.md`; it is not repeated
+here.
 
 ## The four Percolator invariants of the TxnKV path (issue #182)
 

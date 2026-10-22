@@ -20,10 +20,12 @@ jobs:
     with:
       # tests/Unit/Docs/AtomicModeDocumentationGuardTest.php and
       # tests/Unit/Docs/ExtGrpcRequirementGuardTest.php scan README.md and
-      # docs/**/*.md, so changes to them need the unit tests and must not
-      # count as docs-only.
-      docs-regex: '^(CHANGELOG\.md|AGENTS\.md|LICENSE.*|\.github/ISSUE_TEMPLATE/.*|\.github/pull_request_template\.md|\.gitignore)$'
-
+      # docs/**/*.md, and tests/Unit/Docs/StabilityPolicyGuardTest.php scans
+      # README.md, CHANGELOG.md and this workflow file, so changes to them
+      # need the unit tests and must not count as docs-only. CHANGELOG.md is
+      # therefore not in the regex: the stability guard has to run in the
+      # release pull request, which changes the changelog and nothing else.
+      docs-regex: '^(AGENTS\.md|LICENSE.*|\.github/ISSUE_TEMPLATE/.*|\.github/pull_request_template\.md|\.gitignore)$'
   docs:
     name: Docs
     uses: crazy-goat/.github/.github/workflows/docs-check.yml@main
@@ -109,11 +111,11 @@ jobs:
         run: composer install --no-interaction --prefer-dist --no-progress --ignore-platform-req=ext-grpc
 
       - name: Run unit tests
-        run: ./vendor/bin/phpunit --testsuite Unit --testdox --fail-on-skipped --no-coverage
+        run: ./vendor/bin/phpunit --testsuite Unit --testdox --fail-on-skipped --fail-on-empty-test-suite --no-coverage
         timeout-minutes: 5
 
   grpc-unit-tests:
-    name: gRPC Unit Tests (PHP 8.4)
+    name: Unit + gRPC Tests and Coverage (PHP 8.4)
     needs: [changes, lint]
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
@@ -138,9 +140,25 @@ jobs:
       - name: Install dependencies
         run: composer install --no-interaction --prefer-dist --no-progress
 
-      - name: Run gRPC unit tests
-        run: ./vendor/bin/phpunit --testsuite Grpc --testdox --fail-on-skipped --coverage-xml=coverage-xml
-        timeout-minutes: 5
+      # Both suites run in one job so that the Clover report covers the whole
+      # client (the Grpc suite needs ext-grpc, which the unit-tests matrix
+      # job does not install). The matrix job above still runs the Unit suite
+      # on every PHP version without coverage.
+      - name: Run unit and gRPC unit tests with coverage
+        run: ./vendor/bin/phpunit --testsuite Unit,Grpc --testdox --fail-on-skipped --fail-on-empty-test-suite --coverage-clover=coverage.xml
+        timeout-minutes: 10
+
+      - name: Check coverage floor
+        run: php bin/check-coverage.php coverage.xml
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-clover
+          path: coverage.xml
+          if-no-files-found: warn
+          retention-days: 14
 
   integration-tests:
     name: Integration Tests (PHP 8.4)
@@ -169,7 +187,7 @@ jobs:
         run: composer install --no-interaction --prefer-dist --no-progress
 
       - name: Run integration tests
-        run: ./vendor/bin/phpunit --testsuite Integration --testdox --fail-on-skipped --no-coverage
+        run: ./vendor/bin/phpunit --testsuite Integration --testdox --fail-on-skipped --fail-on-empty-test-suite --no-coverage
         timeout-minutes: 5
 
   e2e-tests:
@@ -242,7 +260,7 @@ jobs:
         run: |
           docker compose run --rm \
             -e PD_ENDPOINTS=pd:2379 \
-            php-client vendor/bin/phpunit --testsuite E2E-RawKV --testdox --no-coverage
+            php-client vendor/bin/phpunit --testsuite E2E-RawKV --testdox --fail-on-empty-test-suite --no-coverage
         timeout-minutes: 10
 
       - name: Cleanup V1ttl cluster
@@ -305,7 +323,7 @@ jobs:
         run: |
           docker compose run --rm --no-deps \
             -e PD_ENDPOINTS=pd:2379 \
-            php-client vendor/bin/phpunit --testsuite E2E-TxnKV --testdox --no-coverage
+            php-client vendor/bin/phpunit --testsuite E2E-TxnKV --testdox --fail-on-empty-test-suite --no-coverage
         timeout-minutes: 10
 
       - name: Cleanup V1 cluster

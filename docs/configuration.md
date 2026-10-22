@@ -446,13 +446,59 @@ factory does not build, so they are rejected with an
 on the `GrpcClient` you pass in.
 
 One caveat of sharing: on a retryable transport error the client closes the
-channel of the affected address to force a reconnect. With a shared transport
-that affects every client using the same address — the channel is reopened on
-the next request, but a request in flight on it can be interrupted.
+channel of the affected address. With a shared transport that affects every
+client using the same address — the channel is dropped from the cache and
+reopened on the next request, but a request in flight on it can be
+interrupted. The close does **not** force a reconnect, though: ext-grpc keeps
+the channel in its process-global persistent table, so the reopened channel is
+the same underlying channel and the same TCP connection (see below).
 
 Sharing the transport shares the **channels** only. Every client keeps its own
 region cache and its own store-address cache, so the two clients do not warm
 each other's caches.
+
+`options['metrics']` is a **client-side** option and is always applied: it
+backs the client-side counters (region cache, retries). The transport's own
+RPC counters follow the transport — with an injected transport they are the
+ones it was built with, so pass the same backend to the transport
+(`new GrpcClient(metrics: $metrics)`) to get them everywhere.
+
+#### What the shared channel really is
+
+ext-grpc keeps a **process-global** table of persistent channels, keyed by the
+target, a hash of the channel arguments and a hash of the credentials
+(`ChannelCredentials::createInsecure()` returns `null`, so a plaintext channel
+contributes no credentials hash — a TLS and a plaintext client for the same
+address never share a channel). Two handles built from the same key share
+**one** underlying `grpc_channel` — as long as the key is in that table:
+ext-grpc persists **one channel per target** by default, and a channel
+created beyond that bound is private to its handle ("The number of channel for
+the target is maxed out bounded"). A private channel is never shared, so it
+is never at risk either.
+
+`Channel::close()` is a **reference-count decrement**
+(`php_grpc_channel_unref()`), not a destroy: the underlying channel survives
+until its last holder releases it, and the persistent table is one of those
+holders. Closing one client therefore never invalidates a channel another
+client holds — it only drops that client's own reference to it. Verified
+against the deployed extension (grpc 1.83.0; the persistent-channel code is
+unchanged in the oldest supported release, 1.57).
+
+The practical consequences for the API:
+
+- `close()` releases this client's handles; the TCP connection stays warm in
+  the process (until the process ends or the per-target persist bound drops
+  the entry). It does not tear the connection down.
+- `closeChannel()` drops the cached handle but does **not** force a
+  reconnect: the persistent entry survives, so the next call reuses the same
+  underlying channel and the same TCP connection. Forcing a real reconnect
+  needs a new persistent entry.
+
+Two clients with **different** channel arguments (`options['grpc']`) or
+different credentials for the same store address do not share a channel: the
+connection count per store therefore grows with the number of distinct channel
+configurations in the process, so one shared transport with one configuration
+is the cheapest shape.
 
 ### Environment Variables
 
@@ -761,6 +807,30 @@ $logger->pushHandler(new StreamHandler('php://stderr', Logger::DEBUG));
 // Production - warnings and errors only
 $logger->pushHandler(new StreamHandler('/var/log/tikv.log', Logger::WARNING));
 ```
+
+The region cache asks the logger **once** whether it can emit a `debug`
+record at all, and it builds the log context of a debug record only when the
+answer is yes. A logger that discards the debug records — the default
+`NullLogger`, a Monolog logger above the `DEBUG` level, or any logger that
+answers "no" to Monolog's `isHandling()` — therefore costs nothing on the hot
+path, where the context of a region-cache record carries a redacted key. The
+other components (the lock resolver, the transaction committer, the store
+cache) still build their context unconditionally.
+
+A logger that cannot be asked (a plain PSR-3 logger without a level API) is
+assumed to handle `debug`, so a record is never lost. A `NullLogger`
+*subclass* is assumed to handle `debug` as well, unless it keeps psr/log's
+own `log()` and `debug()` implementations: psr/log does not declare that
+class `final`, so a subclass that overrides either method may record what
+it receives.
+
+The answer is taken **once**, when the client is built, and it is not
+re-examined afterwards. A logger that is reconfigured at runtime — a Monolog
+handler whose level is lowered to `DEBUG`, say — keeps the answer the client
+was given: the cache stays quiet, and a logger that was at `DEBUG` and is
+raised to `INFO` keeps building a context that is discarded. Configure the
+logger's level and handlers **before** you create the client, and create a
+new client after you change them.
 
 ### What Gets Logged
 

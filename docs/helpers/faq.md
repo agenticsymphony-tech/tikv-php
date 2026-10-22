@@ -239,11 +239,26 @@ for RawKV, tears it down with `-v`, then boots a V1 cluster
 available via `docker-compose -f docker-compose.yml -f
 docker-compose.txnkv.yml up`.
 
-## grpc-unit-tests collects coverage, but there is no gate
+## Coverage is enforced: the floor lives in `bin/check-coverage.php`
 
-CI runs the Grpc testsuite with `--coverage-xml` under PCOV, but no
-coverage floor is enforced anywhere (`composer.json` has no
-`coverage:check`). Don't block PRs on coverage percentages.
+CI runs the `Unit` and `Grpc` suites together under PCOV in the `grpc-unit-tests` job, uploads the
+Clover report as the `coverage-clover` artifact and fails the build when the line coverage drops
+below the floor. The floor is `DEFAULT_COVERAGE_FLOOR` in `bin/check-coverage.php` (87.0 %) and it
+is a ratchet — it only moves up. `composer test:coverage` runs the same suites and the same
+check, so a red build is reproducible locally.
+
+Two traps when measuring coverage:
+
+1. **The metric excludes the generated `src/Proto` classes.** `phpunit.xml` excludes them from the
+   `<source>` set; they are ~62 % of the executable lines of `src/` and are not hand-written, so
+   counting them would report 42 % instead of 87 % for the same run.
+2. **A local run needs a coverage driver.** PCOV wins over Xdebug when both are installed
+   (`SebastianBergmann\CodeCoverage\Driver\Selector` checks PCOV first), and the two measure the
+   same metric within a few tenths of a point — but only with Xdebug in coverage mode
+   (`xdebug.mode=coverage`; the default `develop` mode makes PHPUnit report "No code coverage
+   driver is available"). `composer test:coverage` passes `-d xdebug.mode=coverage` for that
+   reason. `ext-grpc` is required too: the `Grpc` suite mocks `\Grpc\Call`, which is a hard error
+   (not a skip) without the extension.
 
 ## Every TiKV `*_ts` protobuf field must be a PD TSO timestamp, never a monotonic-clock value
 
@@ -669,6 +684,67 @@ verdict cell was emptied. The same guard must assert that the
 reflection-derived operation list is **not empty**: a renamed class or a
 changed namespace would otherwise leave it comparing `[]` with `[]`.
 
+## The 0.x semver facts: Composer's caret is patch-only, and a finding's `[Unreleased]` anchor expires
+
+Two facts about the pre-1.0 line, learned while publishing the stability
+policy (issue #406):
+
+1. **Composer resolves a caret constraint on a `0.x` version to the patch
+   range of that minor line.** `^0.8`, `^0.8.0` and `~0.8.0` all mean
+   `>=0.8.0 <0.9.0`; the caret only widens past the minor line when the
+   leftmost non-zero digit is not 0. So the constraint that admits the next
+   minor — and therefore a breaking change — is `^0`, `0.*` or `*` (plus the
+   two-segment tilde `~0.8`, which means `>=0.8 <1.0.0`), **not** `^0.8`.
+   An audit finding that warns "teams will configure `^0.2` and be surprised"
+   is therefore wrong about the tool it names. Check the resolved range
+   (`Composer\Semver\Semver::satisfies()`, or `composer why-not`) before
+   repeating such a claim in the documentation.
+
+2. **A finding's `[Unreleased]` anchor expires when the release is cut.**
+   Issue #406 pointed at `CHANGELOG.md:95` and `:106` inside `[Unreleased]`;
+   by the time it was worked on, v0.4.0 had been released and both entries
+   (the `RawKv` → `Region` namespace move, #111, and the
+   `setAtomicForCAS(true)` prerequisite for CAS, #103) sat in the released
+   section. Grep for the content, not for the line number, and mark the entry
+   where it lives now — the released section is still the honest place for
+   it, because that is the version a consumer upgrades from.
+
+## A guard test only guards where CI runs it — the `docs-regex` decides that
+
+The `changes` job (`.github/workflows/ci.yml`) classifies a pull request as
+documentation-only when **every** changed file matches its `docs-regex`, and
+then skips the unit tests. The default `docs-regex` of the shared workflow
+counts every `*.md` as documentation; this repository narrows it to
+`AGENTS.md`, `LICENSE*`, the issue templates, the pull request template and
+`.gitignore`, so a change in `README.md`, in `docs/**` **or in
+`CHANGELOG.md`** already runs the unit tests. The concrete list lives in the
+workflow file — this entry states the rule, the file carries the list.
+
+The trap: a guard test that **reads** a file has to run when that file
+changes. While the stability policy was being published (issue #406),
+`CHANGELOG.md` was still in the `docs-regex`, so the release pull request —
+which touches the changelog and nothing else — was classified as
+documentation-only and the guard never ran there; the mismatch surfaced in
+the next unrelated code pull request, months away from its cause. The
+changelog was removed from the `docs-regex` in the very change that published
+the policy. Two rules follow:
+
+1. A file that a guard test reads must be **outside** the `docs-regex`, so the
+   guard runs in the pull request that changes the file. The rule is
+   machine-checked for the changelog: `StabilityPolicyGuardTest` fails when
+   the `docs-regex` of the workflow classifies `CHANGELOG.md` as
+   documentation-only.
+2. A guard that compares documentation with the *current* release has to fail
+   **at** the release cut, and the release pull request has to update the
+   documentation in the same commit (`docs/release-workflow.md` lists the
+   step). A guard that "follows the next release" is only useful if it is
+   executed there.
+
+The price of the rule: a changelog-only pull request is a "code change" and
+runs the whole matrix, the two Docker E2E jobs included. That is deliberate —
+a release pull request runs the matrix anyway (it touches `README.md`), and
+the guard belongs to the required `ci-ok` gate, where a failure blocks the
+merge.
 ## TTL mode and TxnKV are mutually exclusive — say it at every enable-ttl recommendation
 
 TiKV with `[storage] enable-ttl = true` runs in V1TTL storage mode, which
@@ -702,14 +778,89 @@ Facts verified empirically (PHPUnit 11.5.55, PR #484 for #323/#358/#359):
    gated. The pattern used in PR #484: whole classes that mock `Call` move to
    the `Grpc` testsuite (`phpunit.xml` `<file>` entries + `<exclude>` from
    `Unit`); tests that are pure PHP (drive the executor with
-   `CheckedGrpcFuture::fromCallable`, no `Call`) stay in `Unit` ungated and
-   also join the Grpc suite as `<file>` entries so the Grpc coverage run
-   (PCOV) exercises the code paths they cover.
-4. `php -n vendor/bin/phpunit --testsuite Unit --fail-on-skipped` is the
+   `CheckedGrpcFuture::fromCallable`, no `Call`) stay in `Unit` ungated.
+4. A file may belong to **one** selected suite per run. Listing the same file
+   in two suites that are selected together (the CI coverage job runs
+   `Unit,Grpc`) makes PHPUnit emit the test-runner warning "Cannot add file …
+   as it was already added to test suite …", and the run then **exits 1** even
+   though every test passed. `ParallelRangeOpsCapTest` and
+   `CheckedGrpcFutureRetryableDispatchTest` were listed in both suites until
+   issue #362; they now live in `Unit` only, which the coverage job runs too.
+5. `php -n vendor/bin/phpunit --testsuite Unit --fail-on-skipped` is the
    faithful local simulation of CI's unit job (php -n = no extensions).
-5. XML comment gotcha hit while documenting this: XML comments cannot
+6. XML comment gotcha hit while documenting this: XML comments cannot
    contain `--` — the phrase `--testsuite` inside an XML comment breaks
    parsing with "Double hyphen within comment". Use "testsuite selector".
+
+## A PHPUnit suite selector that matches nothing exits 0 — use `--fail-on-empty-test-suite`
+
+Facts verified empirically (PHPUnit 11.5.57, issue #361):
+
+1. `--testsuite` accepts a **comma-separated list** — `--testsuite
+   E2E-RawKV,E2E-TxnKV` runs both suites in one process (the list is split on
+   `,` in `TextUI/Configuration/Xml/TestSuiteMapper.php`). Both the
+   `--testsuite X` and the `--testsuite=X` spelling work. The list buys
+   nothing for the end-to-end suites, though: they need cluster modes of
+   their own, so one cluster cannot serve two of them (V1TTL for RawKV, V1
+   for TxnKV, API V2 for ApiV2 — see AGENTS.md and
+   [TxnKV Fails on a TTL-Enabled Cluster](../troubleshooting.md#txnkv-fails-on-a-ttl-enabled-cluster)).
+2. A selector that matches **no** suite prints "No tests executed!" and exits
+   **0**. That is how issue #361 found `composer test:e2e`: the script
+   selected a suite named `E2E`, which `phpunit.xml` never declared (the
+   suites are `E2E-RawKV`, `E2E-TxnKV` and `E2E-ApiV2`). The premise expired
+   before v0.8.0 — PR #594 renamed the selector to `E2E-RawKV` — so no
+   released version had a green no-op E2E command. The lesson stands: an
+   audit issue's premise can silently expire when a later PR changes the
+   code it describes (see "Error-handling docs must be derived from source,
+   not from the issue text" above).
+3. `--fail-on-empty-test-suite` is the flag that turns that into a non-zero
+   exit code ("Signal failure using shell exit code when no tests were
+   run"). It is available in every `^11.0` (verified in 11.0.0).
+   `--fail-on-skipped` is **not** a substitute: it says nothing about an empty
+   selection.
+4. `--fail-on-skipped` is the wrong tool for the E2E suites: they skip
+   legitimately (`tests/E2E/PdFailoverE2ETest.php` skips without Docker
+   access, `tests/E2E/TxnKvE2ETest.php` skips without `proc_open`), so it
+   would turn an ordinary developer machine into a red run.
+5. **A skipped test counts as a test, so `--fail-on-empty-test-suite` does
+   not fire on it.** Measured: `phpunit --testsuite E2E-ApiV2
+   --fail-on-empty-test-suite` prints "Tests: 4, Assertions: 0, Skipped: 4"
+   and exits **0** — a green run that tested nothing, the very failure mode
+   the flag was added for. The API V2 suite skips itself unless
+   `TIKV_API_VERSION=2` is set (`tests/E2E/ApiV2E2ETest.php`), so a runner
+   that leaves the variable out turns the lane into a no-op. The lane that
+   owns the suite (`scripts/test-e2e-suite.sh`) therefore sets
+   `TIKV_API_VERSION=2` itself, requires `TIKV_ALT_KEYSPACE` (the second
+   keyspace the suite compares against — without it one test skips) and adds
+   `--fail-on-skipped`, which is safe there because the suite has no
+   legitimate skip once the environment is set. `scripts/test-e2e-apiv2.sh`
+   (the Docker lane) does the same.
+6. A missing cluster is loud anyway, and it is fast: `tests/E2E/ClusterProbe.php`
+   asks PD for its member list before the first test of a class and **fails**
+   the class when PD does not answer. Without the probe every single test
+   spent the client's whole retry budget (measured: 18.8 s) before it
+   reported the connection error, so the 242 end-to-end tests needed about an
+   hour to print their summary. The probe fails instead of skips on purpose:
+   a skipped suite looks exactly like a suite that tested nothing.
+7. The probe's message has to name the endpoint **and** the way out: the
+   default `pd:2379` is a Docker Compose service name and resolves only
+   inside the compose network, so a run on the host needs
+   `PD_ENDPOINTS=localhost:<published PD port>`. A message that only says
+   "make up starts the cluster" sends a developer who already started it in
+   circles.
+8. The rules are pinned by `tests/Unit/Ci/TestSuiteSelectorGuardTest.php`, which
+   scans `composer.json`, `scripts/*.sh`, the `Makefile`, the
+   `docker-compose*.yml` files and `.github/workflows/*.yml`:
+   - every `--testsuite` selector must name a suite `phpunit.xml` declares;
+   - every PHPUnit invocation must pass `--fail-on-empty-test-suite` — by
+     name (`phpunit`) as well as by path (`vendor/bin/phpunit`);
+   - every end-to-end suite must be selected by some runner, so none is
+     quietly forgotten;
+   - no single PHPUnit invocation may select two end-to-end suites, because
+     they need cluster modes of their own and such a run could never be
+     green;
+   - a runner that selects the API V2 suite must run it with
+     `TIKV_API_VERSION=2`, so the lane cannot skip its whole suite.
 
 ## Rector version drift: local rector ≠ CI rector (no committed composer.lock)
 
@@ -846,6 +997,45 @@ silently fork extra TCP connections. `GrpcClient::channelArgs()` is the
 single seam — its output is the effective channel key material — and it is
 unit-tested via reflection in the Unit suite (`GrpcClientChannelArgsTest`)
 without ext-grpc, since no real channel is created.
+
+## ext-grpc's persistent channels are shared and reference-counted (#283)
+
+`Grpc\Channel` keys its process-global persistent-channel table on the
+target, a SHA-1 of the channel arguments and a SHA-1 of the credentials
+(`ChannelCredentials::createInsecure()` returns `null`, so a plaintext
+channel contributes no credentials hash — a TLS and a plaintext client for
+the same address therefore never share a channel). Two handles built from
+the same key share **one** underlying `grpc_channel` — as long as the key is
+in that table: ext-grpc persists **one channel per target** by default, and a
+channel created beyond that bound is private to its handle ("The number of
+channel for the target is maxed out bounded"). Measured: two handles
+on one target open a single TCP connection. `Channel::close()` is a
+reference-count decrement (`php_grpc_channel_unref()`), **not** a destroy —
+the channel survives until its last holder releases it, and the persistent
+table is one of those holders. Consequences worth remembering:
+
+- closing one `GrpcClient` cannot invalidate a channel another
+  `GrpcClient` holds — the audit finding GRPC-24 assumed otherwise, and the
+  assumption was verified false against the deployed extension (grpc 1.83.0;
+  the persistent-channel code is unchanged in the oldest supported release,
+  1.57, so the conclusion holds across the supported range);
+- a shared channel is always in the persistent table (a channel that is not
+  persisted is never shared), so `close()` is safe even for a channel nobody
+  else holds;
+- `GrpcClient::closeChannel()` does **not** force a reconnect: the persistent
+  entry survives and the next `getChannel()` reuses the same underlying
+  channel. The idle and the LRU eviction have the same effect — they drop
+  the cached handle, not the connection;
+- `GrpcClient::close()` does **not** release the TCP connection either: the
+  persistent entry keeps the channel alive until the process ends (or until
+  the per-target bound drops the entry);
+- `Grpc\Call` keeps a reference to the PHP `Grpc\Channel` object, and
+  `Call::startBatch()` throws `RuntimeException("startBatch Error. Channel is
+  closed")` once that object was closed — so closing a channel that still
+  carries in-flight calls breaks them. Issue #278 therefore defers the close
+  of a busy channel in `closeChannel()` and in the idle and the LRU
+  eviction; `close()` closes the channels it deferred when the client shuts
+  down, which ends the calls that were still running on them.
 
 ## The issue's suggested fix can silently differ from what the test suite needs — reflection seams over protected methods
 
@@ -1745,6 +1935,39 @@ is the reference. `ScanIterator` is unchanged (it always passed a bounded
 `batchSize`). This supersedes the `0 → MAX_SCAN_LIMIT` note in the #332
 negative-limit entry above.
 
+## A scan cap that is *reached* is not a scan that was *truncated* — probe for one more row
+
+The RawKV and the transactional scan paths do **not** share a cap, and they
+must not share the rule for reaching it:
+
+- `RawKvScanner::scan()` pages the range internally when `limit: 0`, so its
+  `maxScanRows` guard fires only when the accumulated rows *exceed* the cap
+  (`assertWithinScanLimit()` compares `> $maxScanRows`). "The cap was
+  reached" and "rows are missing" are the same event there, because the scan
+  keeps reading until the range ends.
+- `Transaction::scan()` does not page: with `limit: 0` it reads the range up
+  to `Transaction::MAX_SCAN_LIMIT` (10240) rows and stops. Deciding "the
+  result is truncated" from the row count alone is wrong there — a range with
+  *exactly* 10240 rows is complete, and refusing it would reject a complete
+  read.
+
+So the transactional scan probes: one `KvScan` for a single row starting at
+`KeyOrder::successor()` of the last key it returned, and
+`ScanLimitExceededException` only when that probe finds a row
+(`TxnReader::assertRangeNotTruncated()`, issue #440). The probe costs one
+extra RPC, and only in the boundary case. Lesson: when a cap is a *memory*
+guard, compare with `>`; when it carries a *contract* ("this call returns the
+whole range"), the difference between "the cap was reached" and "rows are
+missing" has to be established, not assumed — and the second question cannot
+be answered from the row count alone.
+
+The same entry point also has a second, quieter truncation: the write-set
+merge. `finalizeScanResults()` used to apply the scan limit to the *merged*
+result, so a transaction whose write set held in-range keys could have them
+dropped once the TiKV read had filled the budget. The unbounded path no
+longer caps the merge — the cap bounds the TiKV read, and the transaction's
+own writes must stay visible (read-your-writes).
+
 ## The optimistic prewrite primary region is always processed first — the heartbeat guard only bites for async commit (TXN-13, #218)
 
 Issue #218 added a `$primaryLockWritten` guard before heartbeating the primary
@@ -1891,8 +2114,14 @@ priority produces byte-identical requests).
 
 ## A cached gRPC channel must never be closed while calls run on it — `maxChannels` is a soft cap (#278)
 
-`Grpc\Channel::close()` destroys the underlying channel, not just the PHP-side
-reference: every call still running on it dies with it. `GrpcClient`'s LRU
+`Grpc\Channel::close()` drops this client's reference to the underlying
+channel, not just the PHP-side handle: the channel itself is reference-counted
+and stays alive while another holder (or the extension's own persistent table)
+still has it. A call, however, dies with the PHP `Grpc\Channel` object it was
+built on — `Call::startBatch()` then throws `RuntimeException("startBatch
+Error. Channel is closed")` — so closing a channel that still carries
+in-flight calls breaks them, whatever the channel's own reference count says
+(see the ext-grpc entry above for the verified semantics). `GrpcClient`'s LRU
 eviction used to close the least recently used channel whenever the cache was
 at capacity, with no idea whether calls were still running on it — so a batch
 that fanned out over more stores than `maxChannels` (default 64) holds closed
@@ -2132,3 +2361,140 @@ warning as well. `ConnectionFactory::buildSlowLogConfig()` never throws: a
 non-array `slowLog` value, or a non-int threshold, is silently ignored (the
 default wins), unlike `options['tls']` and `options['grpc']`, which fail
 closed.
+
+## Infection forces `stopOnDefect="true"` — one PHP warning truncates the whole mutation score
+
+Infection builds its own PHPUnit configuration for the initial (coverage) run
+and always writes `stopOnDefect="true"` into it
+(`XmlConfigurationManipulator::setStopOnFailureOrDefect()`), overriding whatever
+`phpunit.xml` says — there is no CLI flag to turn it off. `stopOnDefect`
+stops the run at the first *defect*, and a PHP warning is a defect even when
+`failOnWarning` is off.
+
+Consequence: if the test suite triggers a PHP warning, the initial run stops
+there, the coverage report covers only the tests that ran before it, and the
+measured mutation score becomes a function of where the random test order
+happened to stop. The same scope measured 308, 554, 689, 1059, 1621 and 1721
+mutants on six consecutive runs of `src/Client/TxnKv/` + `src/Client/Region/`.
+`--do-not-fail-on-warning` does not help: it keeps the *exit code* at 0, so
+Infection does not abort — it silently continues with the truncated coverage
+and reports a much lower score.
+
+Two ways out, in order of preference:
+
+1. Make the suite warning-free. The warning is usually a real bug:
+   `src/Client/Tls/TlsConfigBuilder.php:174` calls `file_get_contents()` on a
+   file it has not checked for readability.
+2. Exclude the warning-triggering test class from the mutation run with a
+   negative `--filter` (PHPUnit's `--filter` takes a regex, so a negative
+   lookahead works). `infection.json` does this for `TlsConfigBuilderTest`;
+   it covers `src/Client/Tls/`, which is outside the mutation scope, so the
+   measured score is unchanged (verified: the covered lines of every mutated
+   file are identical with and without the filter).
+
+The same mechanism applies to a *failing* test: `stopOnDefect` stops the run
+at the first failure too, and a truncated run does not fail — it reports a
+lower score. So a flaky test makes the mutation score unstable in exactly the
+same way. `tests/Unit/TxnKv/TxnKvFanoutTest.php` asserts a wall-clock bound
+(`assertLessThan(12, $elapsedMs)`) and fails intermittently on a loaded
+machine; that is a test-suite defect to fix on its own, not something the
+mutation configuration can absorb.
+
+## A token-scanning guard test must recognise how `token_get_all()` spells a property, an operator and a keyword
+
+The guard tests of this repo (e.g. `ExceptionMessageRedactionGuardTest`,
+`RegionCacheDebugGuardTest`) read the source with `token_get_all()` instead
+of a regex, and three spellings of that API cost an afternoon if you do not
+know them:
+
+- **A property name is a `T_STRING`, not a `T_VARIABLE`.** `$this->debugEnabled`
+  tokenises as `T_VARIABLE('$this')`, `T_OBJECT_OPERATOR`, `T_STRING('debugEnabled')`.
+  A guard that looks for `T_VARIABLE` with the value `'$debugEnabled'` never
+  matches and reports every call site as unguarded — or, worse, matches
+  nothing and passes vacuously.
+- **`T_OBJECT_OPERATOR` is an *array* token.** The single-character tokens
+  (`(`, `)`, `{`, `}`) come back as plain strings, but `->` has its own token
+  id and comes back as `[T_OBJECT_OPERATOR, '->', line]`. Comparing it with
+  the `T_OBJECT_OPERATOR` **constant** (an `int`) is therefore always false;
+  compare `$token[0] === T_OBJECT_OPERATOR` on the array element.
+- **A keyword is matched by its token id, not by its text.** `T_IF` is the
+  only reliable way to find a statement; searching for the text `if` also
+  matches the `if` of a comment or of a string literal.
+
+The second trap is the dangerous one: a guard that finds *no* call sites
+passes. Give such a test a witness assertion (the repo's
+`NoInfiniteDeadlineGuardTest` carries an `assertSame(2, …)` for exactly this
+reason) or check that it fails when a guard is removed from the source.
+
+## A PHPCS exclude pattern of `*.cache` silently excludes every path that contains "cache"
+
+`phpcs.xml.dist` excludes `*.cache` (meant for the `.phpunit.cache`
+directory), but PHPCS turns an exclude pattern into a **case-insensitive,
+unanchored** regular expression — `*` becomes `.*`, the pattern is wrapped
+in backticks and gets the `i` flag (`Filters/Filter::shouldIgnorePath()`).
+`*.cache` therefore matches every path that contains "cache" *anywhere*, and
+the `tests/Unit/Cache/` directory matches through its own name: **none of
+the files of that directory is linted**, although they sit inside the
+`<file>tests</file>` entry.
+
+`RegionCacheTest.php` (1 violation) and `StoreCacheTest.php` (23) carry
+pre-existing PSR-1 violations ("Each class must be in a file by itself") that
+the lint run never sees, and a new test file under `tests/Unit/Cache/` can
+violate PSR-12 without anybody noticing.
+
+What to do:
+
+- Keep the test doubles in `tests/Unit/Support/` (one class per file — the
+  repo convention) instead of next to the test that uses them, so the file
+  stays PSR-1 clean even while the linter does not look at it.
+- To see what the linter would say about an excluded directory, copy
+  `phpcs.xml.dist` with the pattern changed to something that cannot match
+  (`*.cacheX`) and run PHPCS with that ruleset:
+  `vendor/bin/phpcs --standard=/tmp/phpcs-test.xml tests/Unit/Cache`.
+- Narrowing the pattern (e.g. `*.phpunit.cache`) uncovers the violations
+  above and is a change of its own — it touches files that have nothing to
+  do with the issue at hand.
+
+## A `NullLogger` subclass may record: deciding from `log()` alone silences it
+
+`Psr\Log\NullLogger` is **not** `final`, and psr/log's `NullLogger` extends
+`AbstractLogger`, whose `debug()` routes to `log()`. A subclass that
+overrides `log()` therefore receives the debug records, and a subclass that
+overrides `debug()` records them directly while its `log()` still discards.
+Deciding "does this logger discard everything?" from the `log()` method
+alone therefore silences the second shape: the client stops calling
+`debug()`, and the records that subclass used to get are gone.
+
+The rule that keeps such an optimisation honest is the strict one: **a
+logger counts as discarding only when it is known to discard every
+record**. For `NullLogger` that means the logger keeps psr/log's own `log()`
+*and* `debug()` implementations; a subclass that overrides either one is
+treated as a logger that handles the debug level. The client then builds a
+context it may not need, but no record is ever lost.
+
+`ReflectionMethod::getDeclaringClass()` tells you *which* class declares a
+method, so "is this still psr/log's implementation?" is answered by "is
+`NullLogger` an instance of that declaring class?" —
+`is_a(NullLogger::class, $declaringClass->getName(), true)`. A class that
+is neither `NullLogger` nor one of its parents is a user class that
+overrode the method. Checking one method and not the other is the trap:
+psr/log's `debug()` is inherited from `AbstractLogger`, not from
+`NullLogger`.
+
+## A guard that asks the logger once freezes the answer
+
+An optimisation that asks a logger a question ("do you handle the debug
+level?") and caches the answer takes the answer **once**, at construction —
+that is the whole point, since the question must not be asked on the hot
+path. The consequence is that the answer goes stale when the *logger* is
+reconfigured: a Monolog handler whose level is lowered to `DEBUG` after the
+client was built is not noticed (the client stays quiet), and a logger at
+`DEBUG` whose handler is raised to `INFO` keeps building a context that is
+discarded. The logger object itself cannot be swapped — it is `readonly` —
+but its level can.
+
+Say so where the behaviour is documented (`docs/configuration.md`), and say
+what the user has to do: configure the logger's level and handlers before
+the client is built, and build a new client after changing them. A
+limitation that is only described in the commit message is a limitation
+that the next integrator re-discovers the hard way.
